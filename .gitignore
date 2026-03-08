@@ -1,0 +1,11 @@
+# Build artifacts
+*.o
+*.bin
+*.elf
+runner
+
+# macOS
+.DS_Store
+
+# Claude memory
+.claude/
