@@ -253,27 +253,15 @@ void kernel_main(void *fdt) {
   }
   if (!dbase) psci_off();
 
-  /*
-   * 3. Enable Memory Space + Bus Master.
-   *
-   * Use a 16-bit write to Command (offset 0x04) to avoid touching the Status
-   * register in the upper 16 bits of the same dword. The Status register has
-   * W1C (write-1-to-clear) bits; a 32-bit read-modify-write would read those
-   * bits set and write them back, inadvertently clearing them. In practice VZ
-   * tolerates 32-bit writes here, but 16-bit is correct per the PCI spec.
-   */
+  /* 3. Enable Memory Space + Bus Master (16-bit write to avoid W1C Status bits). */
   mmio_w16(dbase + 0x04, mmio_r16(dbase + 0x04) | 0x06);
 
   /*
    * 4. Determine BAR0 address. All VirtIO PCI caps reference bar_idx=0.
    *
-   * Read the existing BAR0 value, masking the low 4 bits (BAR type info:
-   * memory vs I/O, 32 vs 64-bit, prefetchable). If the address is already
-   * set (e.g. QEMU pre-programs BARs at machine init), use it directly.
-   * If zero (Apple VZ), assign from the FDT's PCI MMIO32 window and write.
-   *
-   * BAR size probing (write 0xFFFF..., read back, restore) works on Apple VZ
-   * but is unnecessary here since we always assign from pci_mmio32_base.
+   * On Apple VZ, BARs are not pre-programmed (address bits are zero).
+   * Assign from the FDT MMIO32 window. On QEMU, BARs are pre-programmed
+   * at machine init, so we use the existing value if non-zero.
    */
   uint32_t bar0_addr = mmio_r32(dbase + 0x10) & ~0xFu;
   if (bar0_addr == 0) {
@@ -281,7 +269,6 @@ void kernel_main(void *fdt) {
     mmio_w32(dbase + 0x10, bar0_addr); /* BAR0 low  */
     mmio_w32(dbase + 0x14, 0);         /* BAR0 high */
   }
-
 
   /*
    * 5. Walk PCI capabilities to find VirtIO config structure addresses.
@@ -363,7 +350,7 @@ void kernel_main(void *fdt) {
   /* Ring the TX doorbell. */
   mmio_w16((uint64_t)notify_cfg + tx_notify_off * notify_off_mult, 1);
 
-  /* Busy-wait until VZ's I/O thread consumes the TX descriptor. */
+  /* Poll until the device consumes the TX descriptor. */
   while (tx_used.idx == 0)
     __asm__ volatile("dsb sy" ::: "memory");
 
