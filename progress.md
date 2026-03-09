@@ -51,6 +51,13 @@ From the actual FDT provided by Apple VZ (ref: zhuowei's gist):
 - Apple VZ does **NOT** pre-program BARs (address bits = 0; only type bits set)
 - Must write `pci_mmio32_base` to BAR0 (16-bit upper stays 0 for 64-bit BAR)
 
+### VirtIO Status Write Timing (CRITICAL)
+Apple VZ processes VirtIO `device_status` writes **asynchronously**. A read
+immediately following a write (the `FEATURES_OK` read-back check) may return
+a stale pre-write value, causing spurious `FEATURES_OK` failures. Fix: insert
+a short NOP delay (~10K cycles) after each status write before any read-back.
+The `VZ_DELAY()` macro in kernel.c handles this.
+
 ### VirtIO Init Quirks
 - **Queue size = 256** — QSIZ must accommodate this
 - **`static inline` required** on MMIO helpers — non-inline defeats volatile semantics

@@ -1,14 +1,10 @@
 #!/bin/bash
 # run.sh — Build the kernel, compile the runner, sign it, and start the VM.
 #
-# Why `stdbuf -oL timeout 3`:
-#   The kernel enters WFI after sending output so Apple VZ can process the
-#   TX queue on its I/O thread. The guest never calls PSCI SYSTEM_OFF — VZ
-#   is still running. We use `timeout 3` to exit after output is delivered.
-#   `stdbuf -oL` keeps stdout line-buffered so output isn't lost on exit.
-#
-# If re-running immediately after a previous run, allow ~2s for VZ to release
-# its hypervisor resources before launching a new VM.
+# The kernel enters WFI after sending output so Apple VZ's I/O thread can
+# deliver the console data to the pipe. `stdbuf -oL timeout 3` ensures:
+#   - stdout is line-buffered (data appears immediately)
+#   - the process is terminated 3 seconds after the VM starts
 set -e
 
 echo "▶ Building kernel..."

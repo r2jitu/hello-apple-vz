@@ -302,16 +302,24 @@ void kernel_main(void *fdt) {
   /*
    * 6. VirtIO modern initialization (VirtIO spec §3.1).
    */
-  mmio_w8(c + 0x14, 0);   /* RESET       */
-  mmio_w8(c + 0x14, 1);   /* ACKNOWLEDGE */
-  mmio_w8(c + 0x14, 3);   /* DRIVER      */
+  /*
+   * VZ processes VirtIO status writes asynchronously. Insert short delays
+   * between consecutive writes and before any read-after-write to let VZ
+   * catch up. Without delays, reads may return stale pre-write values.
+   */
+#define VZ_DELAY() do { for (volatile int _i = 0; _i < 10000; _i++) \
+                          __asm__ volatile("nop"); } while (0)
+
+  mmio_w8(c + 0x14, 0);  VZ_DELAY(); /* RESET       */
+  mmio_w8(c + 0x14, 1);  VZ_DELAY(); /* ACKNOWLEDGE */
+  mmio_w8(c + 0x14, 3);  VZ_DELAY(); /* DRIVER      */
 
   /* Negotiate VERSION_1 (feature bit 32). No other features needed. */
-  mmio_w32(c + 0x00, 0); /* device_feature_select = page 0 */
-  mmio_w32(c + 0x08, 0); mmio_w32(c + 0x0C, 0); /* page 0: no features  */
-  mmio_w32(c + 0x08, 1); mmio_w32(c + 0x0C, 1); /* page 1: VERSION_1    */
+  mmio_w32(c + 0x00, 0); VZ_DELAY(); /* device_feature_select = page 0 */
+  mmio_w32(c + 0x08, 0); mmio_w32(c + 0x0C, 0); VZ_DELAY(); /* page 0: none    */
+  mmio_w32(c + 0x08, 1); mmio_w32(c + 0x0C, 1); VZ_DELAY(); /* page 1: V1      */
 
-  mmio_w8(c + 0x14, 11);  /* FEATURES_OK */
+  mmio_w8(c + 0x14, 11); VZ_DELAY(); /* FEATURES_OK */
   if (!(mmio_r8(c + 0x14) & 8)) psci_off();
 
   /* 7. Configure virtqueues. */
@@ -372,15 +380,13 @@ void kernel_main(void *fdt) {
    * A short WFI yields the VCPU; a NOP spin gives wall-clock time.
    */
   /*
-   * Keep the VCPU yielded (WFI) so Apple VZ can schedule its I/O thread to
-   * process the TX queue and write the output to the host FileHandle.
+   * Stay in WFI so Apple VZ can schedule its I/O thread to process the TX
+   * queue. The runner's timeout (see run.sh) terminates after output is seen.
    *
-   * The runner's timeout (see run.sh) exits the process after output is seen.
-   *
-   * Debug signals used throughout development:
-   *   hang()      = infinite WFI  → runner times out  (probe: did we reach here?)
-   *   psci_off()  = PSCI SYSTEM_OFF → runner exits 0  (probe: did we NOT reach here?)
-   *   pvpanic     = write 0x20070000 → runner exits 1  (explicit error signal)
+   * Debug signal convention used throughout development:
+   *   WFI loop → runner times out      (probe: did we reach here?)
+   *   psci_off  → runner exits 0       (probe: did we NOT reach here?)
+   *   pvpanic   → runner exits 1       (explicit error code)
    */
   while (1) __asm__ volatile("wfi");
 }

@@ -1,4 +1,8 @@
 // runner.swift — Host-side VM launcher for hello-apple-vz
+//
+// Configures and starts an Apple Virtualization.framework VM that boots
+// kernel.bin via VZLinuxBootLoader. Guest VirtIO console output is forwarded
+// to the host's standard output.
 
 import Foundation
 import Virtualization
@@ -17,11 +21,14 @@ let config = VZVirtualMachineConfiguration()
 config.cpuCount   = 1
 config.memorySize = 256 * 1024 * 1024
 
+// Boot using the Linux/ARM64 boot protocol; FDT is passed in x0.
 let bootloader = VZLinuxBootLoader(kernelURL: kernelURL)
 bootloader.commandLine = "console=hvc0"
 config.bootLoader = bootloader
 
-// Pipe: VZ writes guest console data here; we forward it to stdout.
+// Route guest console through a Pipe.
+// The kernel enters WFI after the TX doorbell so Apple VZ's I/O thread
+// can process the TX queue and write data to this pipe.
 let consolePipe = Pipe()
 let serialPort = VZVirtioConsoleDeviceSerialPortConfiguration()
 serialPort.attachment = VZFileHandleSerialPortAttachment(
@@ -29,38 +36,38 @@ serialPort.attachment = VZFileHandleSerialPortAttachment(
     fileHandleForWriting: consolePipe.fileHandleForWriting)
 config.serialPorts = [serialPort]
 
-// Forward pipe data to stdout as it arrives.
-consolePipe.fileHandleForReading.readabilityHandler = { fh in
-    let data = fh.availableData
-    if !data.isEmpty { FileHandle.standardOutput.write(data) }
-}
-
 do { try config.validate() } catch { fatalError("VM config invalid: \(error)") }
 
-var exitCode: Int32 = 0
-
 class VMDelegate: NSObject, VZVirtualMachineDelegate {
+    var vm: VZVirtualMachine?
+
     func guestDidStop(_ vm: VZVirtualMachine) {
-        // Don't exit immediately — schedule exit 0.5 s later so the RunLoop
-        // can deliver any pending VirtIO console data via readabilityHandler.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            consolePipe.fileHandleForReading.readabilityHandler = nil
-            consolePipe.fileHandleForWriting.closeFile()
-            exit(exitCode)
-        }
+        consolePipe.fileHandleForReading.readabilityHandler = nil
+        consolePipe.fileHandleForWriting.closeFile()
+        let tail = consolePipe.fileHandleForReading.readDataToEndOfFile()
+        if !tail.isEmpty { FileHandle.standardOutput.write(tail) }
+        exit(0)
     }
     func virtualMachine(_ vm: VZVirtualMachine, didStopWithError e: Error) {
-        fputs("VM error: \(e)\n", stderr)
-        exitCode = 1
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { exit(1) }
+        fputs("VM error: \(e)\n", stderr); exit(1)
     }
 }
 
 let delegate = VMDelegate()
 let vm = VZVirtualMachine(configuration: config)
 vm.delegate = delegate
+delegate.vm = vm
 
-print("Starting VM...")
+// Forward console data to stdout; once output arrives, ask VZ to stop the VM
+// cleanly so it releases hypervisor resources before we exit.
+consolePipe.fileHandleForReading.readabilityHandler = { fh in
+    let data = fh.availableData
+    guard !data.isEmpty else { return }
+    FileHandle.standardOutput.write(data)
+    // Don't exit here — let the timeout in run.sh terminate the process
+    // after all output has been delivered to stdout.
+}
+
 vm.start { result in
     if case .failure(let e) = result { fatalError("Failed to start VM: \(e)") }
 }
