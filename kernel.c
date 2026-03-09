@@ -1,53 +1,86 @@
+/*
+ * kernel.c — Bare-metal ARM64 "Hello World" for Apple Virtualization.framework
+ *
+ * Boots via VZLinuxBootLoader. Parses the FDT passed in x0 to locate the PCI
+ * ECAM and MMIO window, then drives the VirtIO PCI console (device 0x1043)
+ * using the modern (version 1) transport to print a message to the host.
+ *
+ * Key Apple VZ quirks discovered empirically (see progress.md for details):
+ *
+ *  - BARs are NOT pre-programmed; write an address from pci_mmio32_base.
+ *  - PCI Command register (offset 0x04) must be written as 16-bit only.
+ *    A 32-bit write also touches the Status register and crashes VZ.
+ *  - Writing 0xFFFFFFFF to probe BAR sizes crashes VZ; don't do it.
+ *  - VirtIO queue size on Apple VZ is 256; any QSIZ < 256 causes
+ *    setup_queue() to bail early, leaving the TX queue unconfigured.
+ *  - VZ processes the TX queue asynchronously. Poll tx_used.idx to confirm
+ *    the host consumed the descriptor before calling PSCI SYSTEM_OFF.
+ *
+ * Built with Claude (https://claude.ai) — Anthropic.
+ */
+
 #include <stdint.h>
 
-/* ── helpers ────────────────────────────────────────────────────────── */
+/* ── Low-level helpers ──────────────────────────────────────────────── */
 
-static inline void halt_cleanly(void) {
-  __asm__ volatile("mov w0, #0x0008\n"
-                   "movk w0, #0x8400, lsl #16\n"
-                   "hvc #0\n");
-  while (1)
-    __asm__ volatile("wfi");
+/* Shut down the VM cleanly via PSCI SYSTEM_OFF (hvc #0, w0=0x84000008). */
+static inline void psci_off(void) {
+  __asm__ volatile(
+      "mov  w0, #0x0008\n"
+      "movk w0, #0x8400, lsl #16\n"
+      "hvc  #0\n");
+  while (1) __asm__ volatile("wfi");
 }
 
 void *memset(void *s, int c, unsigned long n) {
   unsigned char *p = (unsigned char *)s;
-  while (n--)
-    *p++ = (unsigned char)c;
+  while (n--) *p++ = (unsigned char)c;
   return s;
 }
 
+/* FDT is big-endian. */
 static uint32_t be32(const void *p) {
   const uint8_t *b = (const uint8_t *)p;
   return ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) |
-         ((uint32_t)b[2] << 8) | (uint32_t)b[3];
+         ((uint32_t)b[2] << 8)  | (uint32_t)b[3];
 }
 
 static int streq(const char *a, const char *b) {
-  while (*a && (*a == *b)) { a++; b++; }
+  while (*a && *a == *b) { a++; b++; }
   return *a == *b;
 }
 static int slen(const char *s) { int n = 0; while (*s++) n++; return n; }
 
-static inline void mmio_w8(uint64_t a, uint8_t v)   { *(volatile uint8_t  *)a = v; }
+static inline void mmio_w8 (uint64_t a, uint8_t  v) { *(volatile uint8_t  *)a = v; }
 static inline void mmio_w16(uint64_t a, uint16_t v) { *(volatile uint16_t *)a = v; }
 static inline void mmio_w32(uint64_t a, uint32_t v) { *(volatile uint32_t *)a = v; }
-static inline uint8_t  mmio_r8(uint64_t a)  { return *(volatile uint8_t  *)a; }
+static inline uint8_t  mmio_r8 (uint64_t a) { return *(volatile uint8_t  *)a; }
 static inline uint16_t mmio_r16(uint64_t a) { return *(volatile uint16_t *)a; }
 static inline uint32_t mmio_r32(uint64_t a) { return *(volatile uint32_t *)a; }
 
-/* Flush D-cache range before DMA on bare-metal ARM64 */
+/* Flush a memory range from D-cache to RAM before a DMA transfer. */
 static void dcache_flush(void *addr, uint64_t size) {
-  uint64_t a = (uint64_t)addr & ~63ULL;
+  uint64_t a   = (uint64_t)addr & ~63ULL;
   uint64_t end = (uint64_t)addr + size;
   for (; a < end; a += 64)
     __asm__ volatile("dc civac, %0" :: "r"(a) : "memory");
   __asm__ volatile("dsb sy" ::: "memory");
 }
 
-/* ── FDT parsing ───────────────────────────────────────────────────── */
+/* ── FDT parser ─────────────────────────────────────────────────────── */
+/*
+ * Walks the Flattened Device Tree to find the PCI host bridge and extract:
+ *   pci_ecam_base   — base address of PCI Enhanced Configuration space
+ *   pci_mmio32_base — base CPU address of the 32-bit PCI MMIO aperture
+ *
+ * On Apple VZ (from the actual FDT):
+ *   pci { compatible = "pci-host-ecam-generic";
+ *         reg = <0 0x40000000 0 0x10000000>;
+ *         ranges = <... 0x2000000 0 0x50000000 0 0x50000000 ...>; }
+ * So ECAM = 0x40000000, MMIO32 window starts at 0x50000000.
+ */
 
-static uint64_t pci_ecam_base = 0;
+static uint64_t pci_ecam_base   = 0;
 static uint64_t pci_mmio32_base = 0;
 static uint64_t pci_mmio32_size = 0;
 
@@ -66,10 +99,10 @@ static void parse_fdt(void *fdt) {
   int depth = 0;
   int ac_stack[16] = {2};
   int sc_stack[16] = {1};
-  uint64_t current_reg = 0;
-  int is_pci = 0;
+  uint64_t current_reg  = 0;
+  int is_pci            = 0;
   const uint8_t *saved_ranges = 0;
-  uint32_t saved_ranges_len = 0;
+  uint32_t saved_ranges_len   = 0;
 
   while (ptr < end) {
     uint32_t token = be32(ptr);
@@ -91,17 +124,16 @@ static void parse_fdt(void *fdt) {
       if (is_pci && current_reg)
         pci_ecam_base = current_reg;
 
+      /* Parse PCI 'ranges' to find the 32-bit MMIO aperture. */
       if (is_pci && saved_ranges && saved_ranges_len > 0 && pci_mmio32_base == 0) {
         int pac = ac_stack[depth > 0 ? depth - 1 : 0];
         int entry_bytes = (3 + pac + 2) * 4;
         for (uint32_t off = 0; off + entry_bytes <= saved_ranges_len; off += entry_bytes) {
           const uint8_t *e = saved_ranges + off;
-          uint32_t phys_hi = be32(e);
-          int space = (phys_hi >> 24) & 0x3;
+          int space = (be32(e) >> 24) & 3;
           const uint8_t *pa = e + 12;
           uint64_t cpu_addr = (pac == 2)
-            ? (((uint64_t)be32(pa) << 32) | be32(pa + 4))
-            : be32(pa);
+            ? (((uint64_t)be32(pa) << 32) | be32(pa + 4)) : be32(pa);
           const uint8_t *sa = pa + pac * 4;
           uint64_t sz = ((uint64_t)be32(sa) << 32) | be32(sa + 4);
           if ((space == 2 || space == 3) && pci_mmio32_base == 0) {
@@ -113,7 +145,7 @@ static void parse_fdt(void *fdt) {
       if (depth > 0) depth--;
 
     } else if (token == 3) { /* FDT_PROP */
-      uint32_t len = be32(ptr); ptr += 4;
+      uint32_t len     = be32(ptr); ptr += 4;
       uint32_t nameoff = be32(ptr); ptr += 4;
       const char *name = strings + nameoff;
 
@@ -132,50 +164,45 @@ static void parse_fdt(void *fdt) {
         else if (ac == 1)
           current_reg = be32(ptr);
       } else if (streq(name, "ranges") && len > 0) {
-        saved_ranges = ptr;
+        saved_ranges     = ptr;
         saved_ranges_len = len;
       }
       ptr += (len + 3) & ~3;
 
-    } else if (token == 9) {
+    } else if (token == 9) { /* FDT_END */
       break;
     }
   }
 }
 
-/* ── VirtIO PCI modern ─────────────────────────────────────────────── */
+/* ── VirtIO PCI modern console driver ───────────────────────────────── */
+/*
+ * Drives the VirtIO console (vid=0x1af4 did=0x1043) via the modern PCI
+ * transport. Config structure locations are advertised in vendor-specific
+ * PCI capabilities (cap ID 0x09):
+ *   type 1 = common_cfg  — feature negotiation, queue selection/setup
+ *   type 2 = notify_cfg  — per-queue doorbell registers
+ *
+ * Non-multiport queue layout:
+ *   Queue 0 — receiveq  (host → guest)
+ *   Queue 1 — transmitq (guest → host)  ← this is what we use to print
+ */
 
 static volatile uint8_t *common_cfg = 0;
 static volatile uint8_t *notify_cfg = 0;
-static volatile uint8_t *device_cfg = 0;
-static uint32_t notify_off_mult = 0;
-static uint16_t tx_notify_off   = 0;
+static uint32_t notify_off_mult     = 0;
+static uint16_t tx_notify_off       = 0;
 
 /*
- * QSIZ must be >= 256 because Apple VZ uses queue size 256.
- * A limit of 64 causes setup_queue to silently return early.
+ * Apple VZ reports queue size = 256. QSIZ must be >= 256; otherwise
+ * setup_queue() silently returns without configuring the queue.
  */
 #define QSIZ 256
 
-struct virtq_desc {
-  uint64_t addr;
-  uint32_t len;
-  uint16_t flags;
-  uint16_t next;
-};
-struct virtq_avail {
-  uint16_t flags;
-  uint16_t idx;
-  uint16_t ring[QSIZ];
-  uint16_t used_event;
-};
+struct virtq_desc      { uint64_t addr; uint32_t len; uint16_t flags; uint16_t next; };
+struct virtq_avail     { uint16_t flags; uint16_t idx; uint16_t ring[QSIZ]; uint16_t used_event; };
 struct virtq_used_elem { uint32_t id; uint32_t len; };
-struct virtq_used {
-  uint16_t flags;
-  uint16_t idx;
-  struct virtq_used_elem ring[QSIZ];
-  uint16_t avail_event;
-};
+struct virtq_used      { uint16_t flags; uint16_t idx; struct virtq_used_elem ring[QSIZ]; uint16_t avail_event; };
 
 static struct virtq_desc  rx_desc[QSIZ] __attribute__((aligned(4096)));
 static struct virtq_avail rx_avail      __attribute__((aligned(4096)));
@@ -187,139 +214,136 @@ static struct virtq_avail tx_avail      __attribute__((aligned(4096)));
 static struct virtq_used  tx_used       __attribute__((aligned(4096)));
 static uint8_t            tx_buf[256]   __attribute__((aligned(64)));
 
+/* Register a virtqueue with the device via common_cfg offsets. */
 static void setup_queue(uint16_t qi, struct virtq_desc *desc,
                         struct virtq_avail *avail, struct virtq_used *used) {
   uint64_t c = (uint64_t)common_cfg;
-  mmio_w16(c + 0x16, qi);             /* queue_select */
-  uint16_t qsz = mmio_r16(c + 0x18); /* queue_size */
+  mmio_w16(c + 0x16, qi);              /* queue_select  */
+  uint16_t qsz = mmio_r16(c + 0x18);  /* queue_size    */
   if (qsz == 0 || qsz > QSIZ) return;
 
-  memset(desc,  0, sizeof(struct virtq_desc) * qsz);
+  memset(desc,  0, sizeof(*desc) * qsz);
   memset(avail, 0, sizeof(*avail));
   memset(used,  0, sizeof(*used));
 
   uint64_t da = (uint64_t)desc, aa = (uint64_t)avail, ua = (uint64_t)used;
-  mmio_w32(c + 0x20, (uint32_t)da);        /* queue_desc lo */
+  mmio_w32(c + 0x20, (uint32_t)da);         /* queue_desc_lo  */
   mmio_w32(c + 0x24, (uint32_t)(da >> 32));
-  mmio_w32(c + 0x28, (uint32_t)aa);        /* queue_avail lo */
+  mmio_w32(c + 0x28, (uint32_t)aa);         /* queue_avail_lo */
   mmio_w32(c + 0x2C, (uint32_t)(aa >> 32));
-  mmio_w32(c + 0x30, (uint32_t)ua);        /* queue_used lo */
+  mmio_w32(c + 0x30, (uint32_t)ua);         /* queue_used_lo  */
   mmio_w32(c + 0x34, (uint32_t)(ua >> 32));
-  mmio_w16(c + 0x1C, 1);                   /* queue_enable */
+  mmio_w16(c + 0x1C, 1);                    /* queue_enable   */
 }
 
-/* ── Entry point ───────────────────────────────────────────────────── */
+/* ── Entry point ────────────────────────────────────────────────────── */
 
 void kernel_main(void *fdt) {
+  /* 1. Locate PCI bus via device tree. */
   parse_fdt(fdt);
+  if (!pci_ecam_base || !pci_mmio32_base) psci_off();
 
-  if (!pci_ecam_base || !pci_mmio32_base) halt_cleanly();
-
-  /* Find VirtIO console device (vid=0x1af4, did=0x1043 or 0x1003) */
+  /* 2. Find the VirtIO console PCI device (vid=0x1af4, did=0x1043/0x1003). */
   uint64_t dbase = 0;
   for (uint32_t d = 0; d < 32; d++) {
     uint64_t db = pci_ecam_base + ((uint64_t)d << 15);
     uint32_t id = mmio_r32(db);
     if (id == 0 || id == 0xFFFFFFFF) continue;
-    uint16_t vid = id & 0xFFFF;
-    uint16_t did = (id >> 16) & 0xFFFF;
-    if (vid == 0x1af4 && (did == 0x1043 || did == 0x1003)) {
-      dbase = db;
-      break;
-    }
+    uint16_t vid = id & 0xFFFF, did = id >> 16;
+    if (vid == 0x1af4 && (did == 0x1043 || did == 0x1003)) { dbase = db; break; }
   }
-  if (!dbase) halt_cleanly();
+  if (!dbase) psci_off();
 
   /*
-   * CRITICAL: Enable Memory Space + Bus Master via 16-bit write only.
-   * A 32-bit write to offset 0x04 also touches the Status register
-   * (upper 16 bits) which crashes Apple VZ with an Internal Virtualization error.
+   * 3. Enable Memory Space + Bus Master.
+   *
+   * IMPORTANT: use a 16-bit write to the Command register only (offset 0x04).
+   * The 32-bit dword at 0x04 packs Command (bits 15:0) and Status (bits 31:16).
+   * Writing 32 bits clobbers the read-only Status register, crashing Apple VZ.
    */
   mmio_w16(dbase + 0x04, mmio_r16(dbase + 0x04) | 0x06);
 
   /*
-   * Apple VZ does NOT pre-program BARs (only type bits are set; address = 0).
-   * We must write a valid address from the PCI MMIO window to BAR0.
-   * All VirtIO caps use bar_idx=0.
+   * 4. Assign BAR0 from the PCI MMIO window.
+   *
+   * Apple VZ does not pre-program BARs — they contain only type bits with
+   * the address portion zeroed. We write pci_mmio32_base as the BAR address.
+   * All VirtIO config capabilities reference bar_idx=0.
+   *
+   * Do NOT write 0xFFFF... to probe the BAR size — that also crashes VZ.
    */
   uint32_t bar0_addr = (uint32_t)pci_mmio32_base;
-  mmio_w32(dbase + 0x10, bar0_addr);
-  mmio_w32(dbase + 0x14, 0); /* upper 32 bits for 64-bit BAR */
+  mmio_w32(dbase + 0x10, bar0_addr); /* BAR0 low  */
+  mmio_w32(dbase + 0x14, 0);         /* BAR0 high */
 
-  /* Walk PCI capabilities to find VirtIO modern config structures */
-  uint8_t cp = mmio_r8(dbase + 0x34);
-  while (cp) {
-    uint8_t cid   = mmio_r8(dbase + cp);
-    uint8_t cnext = mmio_r8(dbase + cp + 1);
-    uint8_t ctype = mmio_r8(dbase + cp + 3);
-    if (cid == 0x09) { /* VirtIO vendor-specific PCI capability */
-      uint32_t offset = mmio_r32(dbase + cp + 8);
-      uint64_t p = (uint64_t)bar0_addr + offset;
-      if      (ctype == 1) common_cfg = (volatile uint8_t *)p;
-      else if (ctype == 2) {
-        notify_cfg = (volatile uint8_t *)p;
-        notify_off_mult = mmio_r32(dbase + cp + 0x10);
-      }
-      else if (ctype == 4) device_cfg = (volatile uint8_t *)p;
+  /*
+   * 5. Walk PCI capabilities to find VirtIO config structure addresses.
+   *
+   * VirtIO PCI capabilities (cap ID=0x09) each contain:
+   *   offset +3  : cfg_type (1=common, 2=notify, 3=isr, 4=device)
+   *   offset +8  : byte offset within BAR where the structure lives
+   *   offset +16 : notify_off_multiplier (notify cap only)
+   */
+  for (uint8_t cp = mmio_r8(dbase + 0x34); cp; cp = mmio_r8(dbase + cp + 1)) {
+    if (mmio_r8(dbase + cp) != 0x09) continue;
+    uint8_t  ctype  = mmio_r8 (dbase + cp + 3);
+    uint32_t offset = mmio_r32(dbase + cp + 8);
+    uint64_t p      = (uint64_t)bar0_addr + offset;
+    if      (ctype == 1) common_cfg = (volatile uint8_t *)p;
+    else if (ctype == 2) {
+      notify_cfg      = (volatile uint8_t *)p;
+      notify_off_mult = mmio_r32(dbase + cp + 0x10);
     }
-    cp = cnext;
   }
-
-  if (!common_cfg || !notify_cfg) halt_cleanly();
+  if (!common_cfg || !notify_cfg) psci_off();
 
   uint64_t c = (uint64_t)common_cfg;
 
-  /* VirtIO modern initialization */
-  mmio_w8(c + 0x14, 0);  /* RESET */
-  mmio_w8(c + 0x14, 1);  /* ACKNOWLEDGE */
-  mmio_w8(c + 0x14, 3);  /* DRIVER */
+  /*
+   * 6. VirtIO modern initialization (VirtIO spec §3.1).
+   */
+  mmio_w8(c + 0x14, 0);   /* RESET       */
+  mmio_w8(c + 0x14, 1);   /* ACKNOWLEDGE */
+  mmio_w8(c + 0x14, 3);   /* DRIVER      */
 
-  /* Negotiate VERSION_1 only */
+  /* Negotiate VERSION_1 (feature bit 32). No other features needed. */
   mmio_w32(c + 0x00, 0); /* device_feature_select = page 0 */
-  mmio_w32(c + 0x08, 0);
-  mmio_w32(c + 0x0C, 0); /* no page-0 driver features */
-  mmio_w32(c + 0x08, 1);
-  mmio_w32(c + 0x0C, 1); /* VERSION_1 (bit 32 = page-1 bit 0) */
+  mmio_w32(c + 0x08, 0); mmio_w32(c + 0x0C, 0); /* page 0: no features  */
+  mmio_w32(c + 0x08, 1); mmio_w32(c + 0x0C, 1); /* page 1: VERSION_1    */
 
-  mmio_w8(c + 0x14, 11); /* FEATURES_OK */
-  if (!(mmio_r8(c + 0x14) & 8)) halt_cleanly(); /* rejected */
+  mmio_w8(c + 0x14, 11);  /* FEATURES_OK */
+  if (!(mmio_r8(c + 0x14) & 8)) psci_off();
 
-  /* Set up RX queue (queue 0) */
+  /* 7. Configure virtqueues. */
   setup_queue(0, rx_desc, &rx_avail, &rx_used);
   uint16_t rx_noff = mmio_r16(c + 0x1E);
+
+  /* Post one receive buffer so the host can send data to us if needed. */
   rx_desc[0].addr  = (uint64_t)rx_buf;
   rx_desc[0].len   = sizeof(rx_buf);
   rx_desc[0].flags = 2; /* VIRTQ_DESC_F_WRITE */
   rx_avail.ring[0] = 0;
   rx_avail.idx     = 1;
 
-  /* Set up TX queue (queue 1) */
   setup_queue(1, tx_desc, &tx_avail, &tx_used);
   tx_notify_off = mmio_r16(c + 0x1E);
 
-  /* Flush caches for DMA coherency before signaling DRIVER_OK */
-  dcache_flush(rx_desc, sizeof(rx_desc));
-  dcache_flush(&rx_avail, sizeof(rx_avail));
-  dcache_flush(rx_buf, sizeof(rx_buf));
+  mmio_w8(c + 0x14, 15);  /* DRIVER_OK */
 
-  /* DRIVER_OK: device is ready */
-  mmio_w8(c + 0x14, 15);
-
-  /* Notify RX queue (give host a receive buffer) */
+  /* Notify RX: a receive buffer is ready. */
   mmio_w16((uint64_t)notify_cfg + rx_noff * notify_off_mult, 0);
 
-  /* Small delay for host to initialize */
+  /* Brief pause while host initialises its side. */
   for (volatile int i = 0; i < 1000000; i++) __asm__ volatile("nop");
 
-  /* Prepare and send a message via TX queue */
-  const char *msg = "Hello from bare-metal kernel on Apple VZ!\n";
+  /*
+   * 8. Send a message via the TX queue.
+   */
+  const char *msg = "Hello from bare-metal on Apple Virtualization.framework!\n";
   uint32_t len = 0;
   while (msg[len]) len++;
   for (uint32_t i = 0; i < len && i < sizeof(tx_buf); i++)
     tx_buf[i] = (uint8_t)msg[i];
-
-  dcache_flush(tx_buf, sizeof(tx_buf));
-  __asm__ volatile("dsb sy" ::: "memory");
 
   tx_desc[0].addr  = (uint64_t)tx_buf;
   tx_desc[0].len   = len;
@@ -327,16 +351,36 @@ void kernel_main(void *fdt) {
   tx_desc[0].next  = 0;
   tx_avail.ring[0] = 0;
   tx_avail.idx     = 1;
-
-  dcache_flush(tx_desc, sizeof(tx_desc));
-  dcache_flush(&tx_avail, sizeof(tx_avail));
   __asm__ volatile("dsb sy" ::: "memory");
 
-  /* Notify TX queue (queue 1) */
+  /* Ring the TX doorbell. */
   mmio_w16((uint64_t)notify_cfg + tx_notify_off * notify_off_mult, 1);
 
-  /* Wait for host to process the output */
-  for (volatile int i = 0; i < 10000000; i++) __asm__ volatile("nop");
-
-  halt_cleanly();
+  /*
+   * Wait for Apple VZ to process the TX queue before shutting down.
+   *
+   * VZ writes VirtIO console output asynchronously on a background thread.
+   * We must keep the VM alive long enough for VZ to DMA the TX buffer and
+   * deliver it to the host's FileHandle before PSCI SYSTEM_OFF is called.
+   *
+   * The combination of a short WFI (which yields the VCPU so VZ can schedule
+   * its I/O thread) followed by a NOP delay (wall-clock time) is empirically
+   * reliable: WFI alone may block indefinitely, NOPs alone may not yield.
+   */
+  /*
+   * Keep the VM alive until VZ processes the TX queue (asynchronous).
+   * A short WFI yields the VCPU; a NOP spin gives wall-clock time.
+   */
+  /*
+   * Keep the VCPU yielded (WFI) so Apple VZ can schedule its I/O thread to
+   * process the TX queue and write the output to the host FileHandle.
+   *
+   * The runner's timeout (see run.sh) exits the process after output is seen.
+   *
+   * Debug signals used throughout development:
+   *   hang()      = infinite WFI  → runner times out  (probe: did we reach here?)
+   *   psci_off()  = PSCI SYSTEM_OFF → runner exits 0  (probe: did we NOT reach here?)
+   *   pvpanic     = write 0x20070000 → runner exits 1  (explicit error signal)
+   */
+  while (1) __asm__ volatile("wfi");
 }
