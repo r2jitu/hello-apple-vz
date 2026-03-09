@@ -365,28 +365,15 @@ void kernel_main(void *fdt) {
   mmio_w16((uint64_t)notify_cfg + tx_notify_off * notify_off_mult, 1);
 
   /*
-   * Wait for Apple VZ to process the TX queue before shutting down.
-   *
-   * VZ writes VirtIO console output asynchronously on a background thread.
-   * We must keep the VM alive long enough for VZ to DMA the TX buffer and
-   * deliver it to the host's FileHandle before PSCI SYSTEM_OFF is called.
-   *
-   * The combination of a short WFI (which yields the VCPU so VZ can schedule
-   * its I/O thread) followed by a NOP delay (wall-clock time) is empirically
-   * reliable: WFI alone may block indefinitely, NOPs alone may not yield.
-   */
-  /*
-   * Keep the VM alive until VZ processes the TX queue (asynchronous).
-   * A short WFI yields the VCPU; a NOP spin gives wall-clock time.
-   */
-  /*
    * Stay in WFI so Apple VZ can schedule its I/O thread to process the TX
-   * queue. The runner's timeout (see run.sh) terminates after output is seen.
+   * queue. VZ writes console data asynchronously; the VCPU must be yielded
+   * (WFI) for VZ to run its I/O thread. run.sh uses `timeout 3` to terminate
+   * the runner after output has been delivered.
    *
    * Debug signal convention used throughout development:
-   *   WFI loop → runner times out      (probe: did we reach here?)
-   *   psci_off  → runner exits 0       (probe: did we NOT reach here?)
-   *   pvpanic   → runner exits 1       (explicit error code)
+   *   WFI loop  → runner times out   (probe: "did we reach this point?")
+   *   psci_off  → runner exits 0     (probe: "did we NOT reach this point?")
+   *   pvpanic   → runner exits 1     (explicit error signal)
    */
   while (1) __asm__ volatile("wfi");
 }
