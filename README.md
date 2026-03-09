@@ -6,7 +6,7 @@ and prints a message to the host terminal via a VirtIO PCI console.
 
 ```
 ▶ Building kernel...
-Built kernel.bin (9372 bytes)
+Built kernel.bin (12417 bytes)
 ▶ Compiling runner...
 ▶ Starting VM...
 Hello from bare-metal on Apple Virtualization.framework!
@@ -27,7 +27,7 @@ Hello from bare-metal on Apple Virtualization.framework!
 
 2. **`kernel.c`** — A single C file that:
    - Parses the FDT passed in `x0` to find the PCI ECAM base and MMIO aperture.
-   - Scans the PCI bus for the VirtIO console device (`vid=0x1af4 did=0x1043`).
+   - Scans the PCI bus for the VirtIO console device (`vid=0x1af4, did=0x1043/0x1003`).
    - Programs the device using the VirtIO 1.x modern PCI transport.
    - Sends a string via the virtqueue TX path, polls `tx_used.idx` for
      completion, then calls PSCI `SYSTEM_OFF`.
@@ -130,8 +130,8 @@ From the FDT passed in `x0` at boot (empirical; parsed at runtime so not hardcod
 4. Assign BAR0: `mmio_w32(dbase + 0x10, bar0_addr)` + `mmio_w32(dbase + 0x14, 0)`.
 5. Walk PCI caps (`cap_ptr` chain) to locate `common_cfg` and `notify_cfg`.
 6. Modern VirtIO init: `RESET` → `ACKNOWLEDGE` → `DRIVER` → negotiate `VERSION_1` → `FEATURES_OK`.
-7. Setup queue 0 (RX) and queue 1 (TX); read per-queue notify offsets.
-8. `DRIVER_OK`; post one RX buffer; notify RX queue.
+7. Setup queue 0 (RX); post one RX buffer into it; setup queue 1 (TX); read per-queue notify offsets.
+8. `DRIVER_OK`; notify RX queue.
 9. Fill TX buffer; update TX avail ring (`avail.idx = 1`); `dsb sy`.
 10. Ring TX doorbell; busy-poll `tx_used.idx` until non-zero; call `psci_off`.
 
@@ -143,6 +143,16 @@ used-ring update. The runner's `readabilityHandler` calls `vm.stop` once data
 arrives as a concurrent safety net, so the process exits only after the output
 is confirmed received. Either path (`psci_off` → `guestDidStop`, or
 `readabilityHandler` → `vm.stop`) leads to a clean exit.
+
+### Not implemented (intentionally omitted for minimality)
+
+| Feature | Why omitted | What you'd add |
+|---|---|---|
+| **MMU / page tables** | Memory is uncached by default (no SCTLR_EL1 set); D-cache flush not needed | `setup_mmu()` in boot.S; enable caching in SCTLR_EL1 |
+| **RX polling** | Guest posts one RX buffer so the host CAN send, but never reads it back | Poll `rx_used.idx`; read `rx_buf` for host-to-guest data |
+| **VirtIO feature negotiation** | Only `VERSION_1` is negotiated; all device-specific features are skipped | Read and mask `device_feature` before writing `driver_feature` |
+| **PCI function scan** | Only function 0 of each device slot is checked | Add a function loop: `(d << 15) | (f << 12)` for `f` in `0..7` |
+| **VirtIO multiport console** | `VIRTIO_CONSOLE_F_MULTIPORT` is not negotiated; single port only | Negotiate feature bit 1; use control queue (queue 2/3) to open named ports |
 
 ### Debugging without output
 

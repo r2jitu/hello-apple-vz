@@ -5,7 +5,7 @@
  * ECAM and MMIO window, then drives the VirtIO PCI console (device 0x1043)
  * using the modern (version 1) transport to print a message to the host.
  *
- * Key Apple VZ quirks discovered empirically (see progress.md for details):
+ * Key Apple VZ quirks discovered empirically (see README for details):
  *
  *  - BARs are NOT pre-programmed; write an address from pci_mmio32_base.
  *  - PCI Command register (offset 0x04) must be written as 16-bit only.
@@ -57,15 +57,6 @@ static inline void mmio_w32(uint64_t a, uint32_t v) { *(volatile uint32_t *)a = 
 static inline uint8_t  mmio_r8 (uint64_t a) { return *(volatile uint8_t  *)a; }
 static inline uint16_t mmio_r16(uint64_t a) { return *(volatile uint16_t *)a; }
 static inline uint32_t mmio_r32(uint64_t a) { return *(volatile uint32_t *)a; }
-
-/* Flush a memory range from D-cache to RAM before a DMA transfer. */
-static void dcache_flush(void *addr, uint64_t size) {
-  uint64_t a   = (uint64_t)addr & ~63ULL;
-  uint64_t end = (uint64_t)addr + size;
-  for (; a < end; a += 64)
-    __asm__ volatile("dc civac, %0" :: "r"(a) : "memory");
-  __asm__ volatile("dsb sy" ::: "memory");
-}
 
 /* ── FDT parser ─────────────────────────────────────────────────────── */
 /*
@@ -174,6 +165,14 @@ static void parse_fdt(void *fdt) {
     }
   }
 }
+
+/*
+ * VZ processes VirtIO status writes asynchronously. Insert short delays
+ * between consecutive writes and before any read-after-write to let VZ
+ * catch up. Without delays, reads may return stale pre-write values.
+ */
+#define VZ_DELAY() do { for (volatile int _i = 0; _i < 10000; _i++) \
+                          __asm__ volatile("nop"); } while (0)
 
 /* ── VirtIO PCI modern console driver ───────────────────────────────── */
 /*
@@ -302,14 +301,6 @@ void kernel_main(void *fdt) {
   /*
    * 6. VirtIO modern initialization (VirtIO spec §3.1).
    */
-  /*
-   * VZ processes VirtIO status writes asynchronously. Insert short delays
-   * between consecutive writes and before any read-after-write to let VZ
-   * catch up. Without delays, reads may return stale pre-write values.
-   */
-#define VZ_DELAY() do { for (volatile int _i = 0; _i < 10000; _i++) \
-                          __asm__ volatile("nop"); } while (0)
-
   mmio_w8(c + 0x14, 0);  VZ_DELAY(); /* RESET       */
   mmio_w8(c + 0x14, 1);  VZ_DELAY(); /* ACKNOWLEDGE */
   mmio_w8(c + 0x14, 3);  VZ_DELAY(); /* DRIVER      */
