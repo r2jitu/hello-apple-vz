@@ -9,13 +9,12 @@
  *
  *  - BARs may not be pre-programmed (Apple VZ); read BAR0 first and only
  *    assign an address from pci_mmio32_base if the address bits are zero.
- *  - PCI Command register (offset 0x04) must be written as 16-bit only.
- *    A 32-bit write also touches the Status register and crashes VZ.
- *  - Writing 0xFFFFFFFF to probe BAR sizes crashes VZ; don't do it.
+ *  - VirtIO status writes are asynchronous; delay after each write and
+ *    before reading back device_status (85% failure rate without delays).
+ *  - After DRIVER_OK the host side needs time to become ready; a pause
+ *    of ~1M nops is required before ringing the TX doorbell.
  *  - VirtIO queue size on Apple VZ is 256; any QSIZ < 256 causes
  *    setup_queue() to bail early, leaving the TX queue unconfigured.
- *  - VZ processes the TX queue asynchronously. Poll tx_used.idx to confirm
- *    the host consumed the descriptor before calling PSCI SYSTEM_OFF.
  *
  * Built with Claude (https://claude.ai) — Anthropic.
  */
@@ -257,9 +256,11 @@ void kernel_main(void *fdt) {
   /*
    * 3. Enable Memory Space + Bus Master.
    *
-   * IMPORTANT: use a 16-bit write to the Command register only (offset 0x04).
-   * The 32-bit dword at 0x04 packs Command (bits 15:0) and Status (bits 31:16).
-   * Writing 32 bits clobbers the read-only Status register, crashing Apple VZ.
+   * Use a 16-bit write to Command (offset 0x04) to avoid touching the Status
+   * register in the upper 16 bits of the same dword. The Status register has
+   * W1C (write-1-to-clear) bits; a 32-bit read-modify-write would read those
+   * bits set and write them back, inadvertently clearing them. In practice VZ
+   * tolerates 32-bit writes here, but 16-bit is correct per the PCI spec.
    */
   mmio_w16(dbase + 0x04, mmio_r16(dbase + 0x04) | 0x06);
 
@@ -271,7 +272,8 @@ void kernel_main(void *fdt) {
    * set (e.g. QEMU pre-programs BARs at machine init), use it directly.
    * If zero (Apple VZ), assign from the FDT's PCI MMIO32 window and write.
    *
-   * Do NOT write 0xFFFF... to probe the BAR size — that crashes Apple VZ.
+   * BAR size probing (write 0xFFFF..., read back, restore) works on Apple VZ
+   * but is unnecessary here since we always assign from pci_mmio32_base.
    */
   uint32_t bar0_addr = mmio_r32(dbase + 0x10) & ~0xFu;
   if (bar0_addr == 0) {
@@ -279,6 +281,7 @@ void kernel_main(void *fdt) {
     mmio_w32(dbase + 0x10, bar0_addr); /* BAR0 low  */
     mmio_w32(dbase + 0x14, 0);         /* BAR0 high */
   }
+
 
   /*
    * 5. Walk PCI capabilities to find VirtIO config structure addresses.

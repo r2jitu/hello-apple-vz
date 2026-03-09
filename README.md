@@ -84,12 +84,10 @@ Apple Virtualization.framework is not QEMU. Several things behave differently:
 
 | Topic | QEMU | Apple VZ |
 |---|---|---|
-| **PCI BAR allocation** | Firmware pre-programs BARs | **BARs not pre-programmed** — read BAR0; if address bits are zero, write address from FDT MMIO window |
-| **BAR sizing** | Write `0xFFFF…` to probe | **Crashes VZ — do not probe BAR sizes** |
-| **PCI Command register** | 32-bit R/M/W to offset `0x04` | **Must be 16-bit write only**; 32-bit clobbers read-only Status and crashes VZ |
+| **PCI BAR allocation** | Firmware pre-programs BARs | **BARs not pre-programmed** — address bits are zero; must write a valid address before use |
 | **VirtIO queue size** | Typically 64 or 128 | **256** — drivers that cap at < 256 silently skip queue setup |
-| **VirtIO status writes** | Synchronous | **Asynchronous** — insert a short delay before reading back `device_status` |
-| **VirtIO TX processing** | Synchronous | **Asynchronous on I/O thread** — `tx_used.idx` is updated, but the host pipe write may occur after; poll `tx_used.idx`, then allow time before `psci_off` |
+| **VirtIO status writes** | Synchronous | **Asynchronous** — must delay between writes and before read-back; 85% failure rate without delays |
+| **VirtIO DRIVER_OK** | Host ready immediately | **Host needs time** — must pause (~1M nops) after DRIVER_OK or TX queue never becomes active |
 | **VirtIO transport** | Legacy or modern | Modern only (device ID `0x1043`) |
 | **UART** | PL011 at `0x09000000` | None — VirtIO console is the only output path |
 
@@ -114,15 +112,6 @@ From the FDT passed in `x0` at boot (empirical; parsed at runtime so not hardcod
 - **`notify_off_multiplier`**: 4
 - All VirtIO PCI caps reference `bar_idx = 0`
 
-### PCI config space access rules
-
-| Operation | Safe? | Notes |
-|---|---|---|
-| 16-bit write to Command (`0x04`) | ✅ | Use `mmio_w16()` only |
-| 32-bit write to Command+Status dword (`0x04`) | ❌ | Clobbers Status → VZ crash |
-| 32-bit write to BAR registers (`0x10`+) | ✅ | Fine |
-| Write `0xFFFFFFFF` to probe BAR size | ❌ | Crashes VZ |
-
 ### VirtIO initialisation sequence
 
 1. Parse FDT for ECAM base and MMIO32 window.
@@ -132,7 +121,7 @@ From the FDT passed in `x0` at boot (empirical; parsed at runtime so not hardcod
 5. Walk PCI caps (`cap_ptr` chain) to locate `common_cfg` and `notify_cfg`.
 6. Modern VirtIO init: `RESET` → `ACKNOWLEDGE` → `DRIVER` → negotiate `VERSION_1` → `FEATURES_OK`.
 7. Setup queue 0 (RX); post one RX buffer into it; setup queue 1 (TX); read per-queue notify offsets.
-8. `DRIVER_OK`; notify RX queue.
+8. `DRIVER_OK`; notify RX queue; **pause ~1M nops** (VZ host side needs time to become ready).
 9. Fill TX buffer; update TX avail ring (`avail.idx = 1`); `dsb sy`.
 10. Ring TX doorbell; busy-poll `tx_used.idx` until non-zero; call `psci_off`.
 
