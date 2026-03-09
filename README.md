@@ -34,8 +34,9 @@ Hello from bare-metal on Apple Virtualization.framework!
 
 3. **`runner.swift`** — A Swift host process that creates a
    `VZVirtualMachineConfiguration`, attaches a VirtIO serial port wired to
-   stdout, and starts the VM. It also calls `vm.stop` as a safety net once
-   pipe data arrives, in case `psci_off` races with VZ flushing the pipe.
+   stdout, and starts the VM. When the kernel calls PSCI `SYSTEM_OFF`, VZ
+   invokes `guestDidStop`, which closes the pipe write end; the runner exits
+   when `readabilityHandler` observes EOF, after all output has been forwarded.
 
 ---
 
@@ -83,7 +84,7 @@ Apple Virtualization.framework is not QEMU. Several things behave differently:
 
 | Topic | QEMU | Apple VZ |
 |---|---|---|
-| **PCI BAR allocation** | Firmware pre-programs BARs | **BARs are zero — you must write the address** |
+| **PCI BAR allocation** | Firmware pre-programs BARs | **BARs not pre-programmed** — read BAR0; if address bits are zero, write address from FDT MMIO window |
 | **BAR sizing** | Write `0xFFFF…` to probe | **Crashes VZ — do not probe BAR sizes** |
 | **PCI Command register** | 32-bit R/M/W to offset `0x04` | **Must be 16-bit write only**; 32-bit clobbers read-only Status and crashes VZ |
 | **VirtIO queue size** | Typically 64 or 128 | **256** — drivers that cap at < 256 silently skip queue setup |
@@ -127,7 +128,7 @@ From the FDT passed in `x0` at boot (empirical; parsed at runtime so not hardcod
 1. Parse FDT for ECAM base and MMIO32 window.
 2. Scan ECAM for device `vid=0x1af4, did=0x1043/0x1003`.
 3. Enable Mem + Bus Master: `mmio_w16(dbase + 0x04, cmd | 0x06)` ← 16-bit only.
-4. Assign BAR0: `mmio_w32(dbase + 0x10, bar0_addr)` + `mmio_w32(dbase + 0x14, 0)`.
+4. Determine BAR0: read existing value (mask low 4 type bits); if zero (Apple VZ), write `pci_mmio32_base` from FDT.
 5. Walk PCI caps (`cap_ptr` chain) to locate `common_cfg` and `notify_cfg`.
 6. Modern VirtIO init: `RESET` → `ACKNOWLEDGE` → `DRIVER` → negotiate `VERSION_1` → `FEATURES_OK`.
 7. Setup queue 0 (RX); post one RX buffer into it; setup queue 1 (TX); read per-queue notify offsets.
@@ -139,10 +140,13 @@ From the FDT passed in `x0` at boot (empirical; parsed at runtime so not hardcod
 
 VZ updates `tx_used.idx` and writes to the host pipe on the same I/O thread
 but not necessarily in that order — the pipe write can land after the
-used-ring update. The runner's `readabilityHandler` calls `vm.stop` once data
-arrives as a concurrent safety net, so the process exits only after the output
-is confirmed received. Either path (`psci_off` → `guestDidStop`, or
-`readabilityHandler` → `vm.stop`) leads to a clean exit.
+used-ring update, and the pipe write can also land after `guestDidStop` fires.
+
+The runner handles this by keeping `readabilityHandler` alive and exiting only
+when the pipe reaches EOF (empty read). `guestDidStop` closes the runner's copy
+of the write end; VZ closes its copy once the VM finishes tearing down. EOF
+arrives only after both write ends are closed — by which point VZ has flushed
+all pending pipe data — so no output is lost regardless of ordering.
 
 ### Not implemented (intentionally omitted for minimality)
 

@@ -3,6 +3,12 @@
 // Configures and starts an Apple Virtualization.framework VM that boots
 // kernel.bin via VZLinuxBootLoader. Guest VirtIO console output is forwarded
 // to the host's standard output.
+//
+// Exit sequence:
+//   psci_off (guest) → guestDidStop (VZ callback) → closes our pipe write end
+//   VZ drains its I/O thread → closes its pipe write end (EOF)
+//   readabilityHandler sees EOF → exit(0)
+// This ordering ensures all console output is forwarded before the process exits.
 
 import Foundation
 import Virtualization
@@ -23,7 +29,6 @@ config.memorySize = 256 * 1024 * 1024
 
 // Boot using the Linux/ARM64 boot protocol; FDT is passed in x0.
 let bootloader = VZLinuxBootLoader(kernelURL: kernelURL)
-bootloader.commandLine = "console=hvc0"
 config.bootLoader = bootloader
 
 // Route guest console through a Pipe.
@@ -37,14 +42,11 @@ config.serialPorts = [serialPort]
 do { try config.validate() } catch { fatalError("VM config invalid: \(error)") }
 
 class VMDelegate: NSObject, VZVirtualMachineDelegate {
-    var vm: VZVirtualMachine?
-
     func guestDidStop(_ vm: VZVirtualMachine) {
-        consolePipe.fileHandleForReading.readabilityHandler = nil
+        // Close our copy of the write end. VZ holds its own copy and will
+        // close it when the VM finishes tearing down. Once both ends close
+        // the pipe reaches EOF, and readabilityHandler below calls exit(0).
         consolePipe.fileHandleForWriting.closeFile()
-        let tail = consolePipe.fileHandleForReading.readDataToEndOfFile()
-        if !tail.isEmpty { FileHandle.standardOutput.write(tail) }
-        exit(0)
     }
     func virtualMachine(_ vm: VZVirtualMachine, didStopWithError e: Error) {
         fputs("VM error: \(e)\n", stderr); exit(1)
@@ -54,14 +56,13 @@ class VMDelegate: NSObject, VZVirtualMachineDelegate {
 let delegate = VMDelegate()
 let vm = VZVirtualMachine(configuration: config)
 vm.delegate = delegate
-delegate.vm = vm
 
-// Forward console data to stdout.
+// Forward console data to stdout. When the pipe reaches EOF (all write ends
+// closed after the VM stops), exit cleanly.
 consolePipe.fileHandleForReading.readabilityHandler = { fh in
     let data = fh.availableData
-    guard !data.isEmpty else { return }
+    if data.isEmpty { exit(0) }   // EOF — VM stopped, all output forwarded
     FileHandle.standardOutput.write(data)
-    DispatchQueue.main.async { vm.stop { _ in exit(0) } }
 }
 
 vm.start { result in

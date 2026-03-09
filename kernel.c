@@ -7,7 +7,8 @@
  *
  * Key Apple VZ quirks discovered empirically (see README for details):
  *
- *  - BARs are NOT pre-programmed; write an address from pci_mmio32_base.
+ *  - BARs may not be pre-programmed (Apple VZ); read BAR0 first and only
+ *    assign an address from pci_mmio32_base if the address bits are zero.
  *  - PCI Command register (offset 0x04) must be written as 16-bit only.
  *    A 32-bit write also touches the Status register and crashes VZ.
  *  - Writing 0xFFFFFFFF to probe BAR sizes crashes VZ; don't do it.
@@ -263,17 +264,21 @@ void kernel_main(void *fdt) {
   mmio_w16(dbase + 0x04, mmio_r16(dbase + 0x04) | 0x06);
 
   /*
-   * 4. Assign BAR0 from the PCI MMIO window.
+   * 4. Determine BAR0 address. All VirtIO PCI caps reference bar_idx=0.
    *
-   * Apple VZ does not pre-program BARs — they contain only type bits with
-   * the address portion zeroed. We write pci_mmio32_base as the BAR address.
-   * All VirtIO config capabilities reference bar_idx=0.
+   * Read the existing BAR0 value, masking the low 4 bits (BAR type info:
+   * memory vs I/O, 32 vs 64-bit, prefetchable). If the address is already
+   * set (e.g. QEMU pre-programs BARs at machine init), use it directly.
+   * If zero (Apple VZ), assign from the FDT's PCI MMIO32 window and write.
    *
-   * Do NOT write 0xFFFF... to probe the BAR size — that also crashes VZ.
+   * Do NOT write 0xFFFF... to probe the BAR size — that crashes Apple VZ.
    */
-  uint32_t bar0_addr = (uint32_t)pci_mmio32_base;
-  mmio_w32(dbase + 0x10, bar0_addr); /* BAR0 low  */
-  mmio_w32(dbase + 0x14, 0);         /* BAR0 high */
+  uint32_t bar0_addr = mmio_r32(dbase + 0x10) & ~0xFu;
+  if (bar0_addr == 0) {
+    bar0_addr = (uint32_t)pci_mmio32_base;
+    mmio_w32(dbase + 0x10, bar0_addr); /* BAR0 low  */
+    mmio_w32(dbase + 0x14, 0);         /* BAR0 high */
+  }
 
   /*
    * 5. Walk PCI capabilities to find VirtIO config structure addresses.
