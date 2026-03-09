@@ -69,7 +69,9 @@ swiftc -framework Virtualization runner.swift -o runner
 codesign --entitlements entitlements.plist --force -s - runner
 
 # 3. Run the VM
-./runner
+# stdbuf -oL forces line-buffered output; timeout 3 terminates after output arrives
+# (the kernel stays in WFI indefinitely — it never calls PSCI shutdown)
+stdbuf -oL timeout 3 ./runner || true
 ```
 
 ---
@@ -84,6 +86,8 @@ Apple Virtualization.framework is not QEMU. Several things behave differently:
 | **BAR sizing** | Write 0xFFFF… to probe | **Crashes VZ — do not probe BAR sizes** |
 | **PCI Command register** | 32-bit R/M/W to offset 0x04 | **Must be 16-bit write only**; 32-bit clobbers read-only Status and crashes VZ |
 | **VirtIO queue size** | Typically 64 or 128 | **256** — drivers that cap at < 256 silently skip queue setup |
+| **VirtIO status writes** | Synchronous | **Asynchronous** — insert a short delay before reading back `device_status` |
+| **VirtIO TX processing** | Immediate or poll `tx_used.idx` | **Asynchronous on I/O thread**; VCPU must be in WFI; `tx_used.idx` is never updated |
 | **VirtIO transport** | Legacy or modern | Modern only (device ID 0x1043) |
 | **UART** | PL011 at 0x09000000 | None — VirtIO console is the only output path |
 
@@ -100,11 +104,12 @@ The FDT is parsed at runtime so the kernel doesn't hard-code these.
 
 ### Debugging without output
 
-With no UART, pre-output debugging relies on binary tracing:
-- **`hang()`** (infinite WFI loop) vs **`psci_off()`** (clean shutdown via PSCI
-  `SYSTEM_OFF`) produce distinguishable host-side behavior: timeout vs. immediate
-  exit.
-- Use `stdbuf -oL ./runner` when piping, otherwise stdout may be lost on kill.
+With no UART, binary tracing through execution behavior:
+- **WFI loop** → `stdbuf -oL timeout N ./runner` times out (EXIT 124): "we reached this point"
+- **`psci_off()`** → runner exits 0 immediately: "we did NOT reach this point"
+- **pvpanic write** to `0x20070000` → runner exits with error: explicit error signal
+
+This lets you binary-search the execution path without any output device.
 
 ---
 
