@@ -13,8 +13,6 @@
  *    before reading back device_status (85% failure rate without delays).
  *  - After DRIVER_OK the host side needs time to become ready; a pause
  *    of ~1M nops is required before ringing the TX doorbell.
- *  - VirtIO queue size on Apple VZ is 256; any QSIZ < 256 causes
- *    setup_queue() to bail early, leaving the TX queue unconfigured.
  *
  * Built with Claude (https://claude.ai) — Anthropic.
  */
@@ -192,11 +190,8 @@ static volatile uint8_t *notify_cfg = 0;
 static uint32_t notify_off_mult     = 0;
 static uint16_t tx_notify_off       = 0;
 
-/*
- * Apple VZ reports queue size = 256. QSIZ must be >= 256; otherwise
- * setup_queue() silently returns without configuring the queue.
- */
-#define QSIZ 256
+/* Maximum queue size our static buffers can hold; actual size is read from the device. */
+#define QSIZ 1024
 
 struct virtq_desc      { uint64_t addr; uint32_t len; uint16_t flags; uint16_t next; };
 struct virtq_avail     { uint16_t flags; uint16_t idx; uint16_t ring[QSIZ]; uint16_t used_event; };

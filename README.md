@@ -85,7 +85,6 @@ Apple Virtualization.framework is not QEMU. Several things behave differently:
 | Topic | QEMU | Apple VZ |
 |---|---|---|
 | **PCI BAR allocation** | Firmware pre-programs BARs | **BARs not pre-programmed** — address bits are zero; must write a valid address before use |
-| **VirtIO queue size** | Typically 64 or 128 | **256** — drivers that cap at < 256 silently skip queue setup |
 | **VirtIO status writes** | Synchronous | **Asynchronous** — must delay between writes and before read-back; 85% failure rate without delays |
 | **VirtIO DRIVER_OK** | Host ready immediately | **Host needs time** — must pause (~1M nops) after DRIVER_OK or TX queue never becomes active |
 | **VirtIO transport** | Legacy or modern | Modern only (device ID `0x1043`) |
@@ -108,7 +107,7 @@ From the FDT passed in `x0` at boot (empirical; parsed at runtime so not hardcod
 ### VirtIO console device
 
 - **Vendor/Device ID**: `0x1af4` / `0x1043` (modern VirtIO console)
-- **Queue size**: 256 (`QSIZ` must be ≥ 256 or `setup_queue` silently returns)
+- **Queue size**: 256 (empirical; read from device at runtime)
 - **`notify_off_multiplier`**: 4
 - All VirtIO PCI caps reference `bar_idx = 0`
 
