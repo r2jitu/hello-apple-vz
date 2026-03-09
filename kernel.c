@@ -364,16 +364,9 @@ void kernel_main(void *fdt) {
   /* Ring the TX doorbell. */
   mmio_w16((uint64_t)notify_cfg + tx_notify_off * notify_off_mult, 1);
 
-  /*
-   * Stay in WFI so Apple VZ can schedule its I/O thread to process the TX
-   * queue. VZ writes console data asynchronously; the VCPU must be yielded
-   * (WFI) for VZ to run its I/O thread. run.sh uses `timeout 3` to terminate
-   * the runner after output has been delivered.
-   *
-   * Debug signal convention used throughout development:
-   *   WFI loop  → runner times out   (probe: "did we reach this point?")
-   *   psci_off  → runner exits 0     (probe: "did we NOT reach this point?")
-   *   pvpanic   → runner exits 1     (explicit error signal)
-   */
-  while (1) __asm__ volatile("wfi");
+  /* Busy-wait until VZ's I/O thread consumes the TX descriptor. */
+  while (tx_used.idx == 0)
+    __asm__ volatile("dsb sy" ::: "memory");
+
+  psci_off();
 }

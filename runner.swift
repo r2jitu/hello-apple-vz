@@ -27,8 +27,6 @@ bootloader.commandLine = "console=hvc0"
 config.bootLoader = bootloader
 
 // Route guest console through a Pipe.
-// The kernel enters WFI after the TX doorbell so Apple VZ's I/O thread
-// can process the TX queue and write data to this pipe.
 let consolePipe = Pipe()
 let serialPort = VZVirtioConsoleDeviceSerialPortConfiguration()
 serialPort.attachment = VZFileHandleSerialPortAttachment(
@@ -58,14 +56,12 @@ let vm = VZVirtualMachine(configuration: config)
 vm.delegate = delegate
 delegate.vm = vm
 
-// Forward console data to stdout; once output arrives, ask VZ to stop the VM
-// cleanly so it releases hypervisor resources before we exit.
+// Forward console data to stdout.
 consolePipe.fileHandleForReading.readabilityHandler = { fh in
     let data = fh.availableData
     guard !data.isEmpty else { return }
     FileHandle.standardOutput.write(data)
-    // Don't exit here — let the timeout in run.sh terminate the process
-    // after all output has been delivered to stdout.
+    DispatchQueue.main.async { vm.stop { _ in exit(0) } }
 }
 
 vm.start { result in
