@@ -10,6 +10,7 @@ Built kernel.bin (9372 bytes)
 ▶ Compiling runner...
 ▶ Starting VM...
 Hello from bare-metal on Apple Virtualization.framework!
+▶ Done.
 ```
 
 > **Built with Claude** — This project was developed interactively with
@@ -28,11 +29,13 @@ Hello from bare-metal on Apple Virtualization.framework!
    - Parses the FDT passed in `x0` to find the PCI ECAM base and MMIO aperture.
    - Scans the PCI bus for the VirtIO console device (`vid=0x1af4 did=0x1043`).
    - Programs the device using the VirtIO 1.x modern PCI transport.
-   - Sends a string to the host via the virtqueue TX path.
+   - Sends a string via the virtqueue TX path, polls `tx_used.idx` for
+     completion, then calls PSCI `SYSTEM_OFF`.
 
 3. **`runner.swift`** — A Swift host process that creates a
    `VZVirtualMachineConfiguration`, attaches a VirtIO serial port wired to
-   stdout, and starts the VM.
+   stdout, and starts the VM. It also calls `vm.stop` as a safety net once
+   pipe data arrives, in case `psci_off` races with VZ flushing the pipe.
 
 ---
 
@@ -53,7 +56,7 @@ Hello from bare-metal on Apple Virtualization.framework!
 ## Quick start
 
 ```sh
-git clone https://github.com/YOUR_USERNAME/hello-apple-vz
+git clone https://github.com/r2jitu/hello-apple-vz
 cd hello-apple-vz
 bash run.sh
 ```
@@ -68,10 +71,8 @@ bash build.sh
 swiftc -framework Virtualization runner.swift -o runner
 codesign --entitlements entitlements.plist --force -s - runner
 
-# 3. Run the VM
-# stdbuf -oL forces line-buffered output; timeout 3 terminates after output arrives
-# (the kernel stays in WFI indefinitely — it never calls PSCI shutdown)
-stdbuf -oL timeout 3 ./runner || true
+# 3. Run the VM (exits cleanly when the kernel calls PSCI SYSTEM_OFF)
+./runner
 ```
 
 ---
@@ -83,47 +84,88 @@ Apple Virtualization.framework is not QEMU. Several things behave differently:
 | Topic | QEMU | Apple VZ |
 |---|---|---|
 | **PCI BAR allocation** | Firmware pre-programs BARs | **BARs are zero — you must write the address** |
-| **BAR sizing** | Write 0xFFFF… to probe | **Crashes VZ — do not probe BAR sizes** |
-| **PCI Command register** | 32-bit R/M/W to offset 0x04 | **Must be 16-bit write only**; 32-bit clobbers read-only Status and crashes VZ |
+| **BAR sizing** | Write `0xFFFF…` to probe | **Crashes VZ — do not probe BAR sizes** |
+| **PCI Command register** | 32-bit R/M/W to offset `0x04` | **Must be 16-bit write only**; 32-bit clobbers read-only Status and crashes VZ |
 | **VirtIO queue size** | Typically 64 or 128 | **256** — drivers that cap at < 256 silently skip queue setup |
 | **VirtIO status writes** | Synchronous | **Asynchronous** — insert a short delay before reading back `device_status` |
-| **VirtIO TX processing** | Immediate or poll `tx_used.idx` | **Asynchronous on I/O thread**; VCPU must be in WFI; `tx_used.idx` is never updated |
-| **VirtIO transport** | Legacy or modern | Modern only (device ID 0x1043) |
-| **UART** | PL011 at 0x09000000 | None — VirtIO console is the only output path |
+| **VirtIO TX processing** | Synchronous | **Asynchronous on I/O thread** — `tx_used.idx` is updated, but the host pipe write may occur after; poll `tx_used.idx`, then allow time before `psci_off` |
+| **VirtIO transport** | Legacy or modern | Modern only (device ID `0x1043`) |
+| **UART** | PL011 at `0x09000000` | None — VirtIO console is the only output path |
 
-### Device tree addresses (empirical, may change)
+### Device tree addresses
 
-| Region | Address |
-|---|---|
-| RAM base | `0x70000000` |
-| PCI ECAM | `0x40000000` |
-| PCI MMIO32 aperture | `0x50000000` |
-| pvpanic MMIO | `0x20070000` |
+From the FDT passed in `x0` at boot (empirical; parsed at runtime so not hardcoded):
 
-The FDT is parsed at runtime so the kernel doesn't hard-code these.
+| Region | Address | Size |
+|---|---|---|
+| RAM | `0x70000000` | 1 GB |
+| GIC | `0x10000000` | — |
+| pvpanic MMIO | `0x20070000` | — |
+| PCI ECAM | `0x40000000` | 256 MB |
+| PCI I/O window | `0x6fff0000` | 64 KB |
+| PCI MMIO32 window | `0x50000000` | ~510 MB |
+| PCI MMIO64 window | `0x100000000` | 1 GB |
+
+### VirtIO console device
+
+- **Vendor/Device ID**: `0x1af4` / `0x1043` (modern VirtIO console)
+- **Queue size**: 256 (`QSIZ` must be ≥ 256 or `setup_queue` silently returns)
+- **`notify_off_multiplier`**: 4
+- All VirtIO PCI caps reference `bar_idx = 0`
+
+### PCI config space access rules
+
+| Operation | Safe? | Notes |
+|---|---|---|
+| 16-bit write to Command (`0x04`) | ✅ | Use `mmio_w16()` only |
+| 32-bit write to Command+Status dword (`0x04`) | ❌ | Clobbers Status → VZ crash |
+| 32-bit write to BAR registers (`0x10`+) | ✅ | Fine |
+| Write `0xFFFFFFFF` to probe BAR size | ❌ | Crashes VZ |
+
+### VirtIO initialisation sequence
+
+1. Parse FDT for ECAM base and MMIO32 window.
+2. Scan ECAM for device `vid=0x1af4, did=0x1043/0x1003`.
+3. Enable Mem + Bus Master: `mmio_w16(dbase + 0x04, cmd | 0x06)` ← 16-bit only.
+4. Assign BAR0: `mmio_w32(dbase + 0x10, bar0_addr)` + `mmio_w32(dbase + 0x14, 0)`.
+5. Walk PCI caps (`cap_ptr` chain) to locate `common_cfg` and `notify_cfg`.
+6. Modern VirtIO init: `RESET` → `ACKNOWLEDGE` → `DRIVER` → negotiate `VERSION_1` → `FEATURES_OK`.
+7. Setup queue 0 (RX) and queue 1 (TX); read per-queue notify offsets.
+8. `DRIVER_OK`; post one RX buffer; notify RX queue.
+9. Fill TX buffer; update TX avail ring (`avail.idx = 1`); `dsb sy`.
+10. Ring TX doorbell; busy-poll `tx_used.idx` until non-zero; call `psci_off`.
+
+### Output reliability
+
+VZ updates `tx_used.idx` and writes to the host pipe on the same I/O thread
+but not necessarily in that order — the pipe write can land after the
+used-ring update. The runner's `readabilityHandler` calls `vm.stop` once data
+arrives as a concurrent safety net, so the process exits only after the output
+is confirmed received. Either path (`psci_off` → `guestDidStop`, or
+`readabilityHandler` → `vm.stop`) leads to a clean exit.
 
 ### Debugging without output
 
-With no UART, binary tracing through execution behavior:
-- **WFI loop** → `stdbuf -oL timeout N ./runner` times out (EXIT 124): "we reached this point"
-- **`psci_off()`** → runner exits 0 immediately: "we did NOT reach this point"
-- **pvpanic write** to `0x20070000` → runner exits with error: explicit error signal
+With no UART, execution state can be encoded as behaviour:
 
-This lets you binary-search the execution path without any output device.
+- **`psci_off()`** → runner exits 0 immediately: reached this point cleanly.
+- **`while (1) wfi`** → runner hangs (kill with Ctrl-C): reached this point but did not exit.
+- **pvpanic write** to `0x20070000` → runner exits with error: explicit error signal.
+
+This allows binary-search debugging of the boot path without any output device.
 
 ---
 
 ## File overview
 
 ```
-boot.S          ARM64 boot stub: Linux image header, exception vectors, BSS clear
-kernel.c        Bare-metal C kernel: FDT parser + VirtIO PCI console driver
-runner.swift    Swift host: Virtualization.framework VM configuration and launcher
-linker.ld       LLD linker script: flat binary, BSS, 64 KB stack
-build.sh        Compile kernel.c + boot.S → kernel.bin
-run.sh          Full build + sign + run pipeline
+boot.S              ARM64 boot stub: Linux image header, exception vectors, BSS clear
+kernel.c            Bare-metal C kernel: FDT parser + VirtIO PCI console driver
+runner.swift        Swift host: Virtualization.framework VM configuration and launcher
+linker.ld           LLD linker script: flat binary, BSS, 64 KB stack
+build.sh            Compile kernel.c + boot.S → kernel.bin
+run.sh              Full build + sign + run pipeline
 entitlements.plist  com.apple.security.virtualization entitlement for the runner
-progress.md     Development log with detailed Apple VZ findings
 ```
 
 ---
